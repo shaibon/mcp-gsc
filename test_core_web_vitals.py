@@ -138,5 +138,63 @@ class Behaviour(unittest.TestCase):
         self.assertEqual(sum(1 for c in calls if c[0] == "GET"), 2)
 
 
+def psi_response():
+    opp = lambda title, ms, kb, urls: {"title": title, "details": {"type": "opportunity", "overallSavingsMs": ms, "overallSavingsBytes": kb * 1024,
+                                                                     "items": [{"url": u} for u in urls]}}
+    audits = {
+        "largest-contentful-paint": {"displayValue": "3.4 s"},
+        "cumulative-layout-shift": {"displayValue": "0.31", "numericValue": 0.31},
+        "render-blocking-resources": opp("Eliminate render-blocking resources", 900, 0, ["https://x.com/a.css?token=SECRETQ", "https://x.com/b.js", "https://x.com/c.js", "https://x.com/d.js"]),
+        "uses-optimized-images": opp("Efficiently encode images", 400, 350, ["https://x.com/hero.jpg"]),
+        "unused-javascript": {"title": "x", "details": {"type": "opportunity", "overallSavingsMs": 0, "items": []}},
+        "largest-contentful-paint-element": {"details": {"type": "list", "items": [
+            {"type": "table", "items": [{"node": {"selector": "div.hero > img", "snippet": "<img>"}}]},
+            {"type": "table", "items": [{"phase": "TTFB", "timing": 600.4}, {"phase": "Load Delay", "timing": 120}]}]}},
+        "bootup-time": {"details": {"items": [{"url": "https://t.io/tag.js?k=1", "total": 800, "scripting": 700}, {"url": "https://x.com/app.js", "total": 300, "scripting": 200}]}},
+        "mainthread-work-breakdown": {"details": {"items": [{"group": "scriptEvaluation", "groupLabel": "Script Evaluation", "duration": 1200}]}},
+        "third-party-summary": {"details": {"items": [{"entity": "Google Tag Manager", "blockingTime": 150, "transferSize": 204800}]}},
+        "layout-shift-elements": {"details": {"items": [{"node": {"selector": "div.banner"}, "score": 0.25}]}},
+    }
+    return {"lighthouseResult": {"categories": {"performance": {"score": 0.5}}, "audits": audits}}
+
+
+class LabDiagnostics(unittest.TestCase):
+    def call(self, **kw):
+        calls = []
+
+        def fake(method, url, key, body=None):
+            calls.append(url)
+            return crux_record() if method == "POST" else psi_response()
+        with patch.dict(os.environ, {"PAGESPEED_KEY_PATH": key_file()}), patch.object(g, "_cwv_http", fake):
+            return json.loads(run(g.get_core_web_vitals("https://example.com/p", include_lab=True, **kw))), calls
+
+    def test_diagnostics_shape_and_limits(self):
+        out, calls = self.call(lab_strategy="mobile")
+        m = out["lab_data"]["mobile"]
+        self.assertEqual(len([c for c in calls if "pagespeed" in c]), 1)
+        self.assertEqual([o["saves_ms"] for o in m["opportunities"]], [900, 400])
+        self.assertEqual(len(m["opportunities"][0]["resources"]), 3)
+        self.assertNotIn("SECRETQ", json.dumps(m))
+        self.assertEqual(m["opportunities"][1]["saves_kb"], 350)
+        self.assertEqual(m["lcp_element"], "div.hero > img")
+        self.assertEqual(m["lcp_phases_ms"]["TTFB"], 600)
+        self.assertEqual(m["slow_scripts"][0]["url"], "https://t.io/tag.js")
+        self.assertEqual(m["main_thread_ms"], {"Script Evaluation": 1200})
+        self.assertEqual(m["third_parties"][0], {"entity": "Google Tag Manager", "blocking_ms": 150, "transfer_kb": 200})
+        self.assertEqual(m["layout_shift_elements"][0]["element"], "div.banner")
+
+    def test_layout_shift_only_when_cls_high_and_both_default(self):
+        out, calls = self.call()
+        self.assertEqual(len([c for c in calls if "pagespeed" in c]), 2)
+        self.assertIn("desktop", out["lab_data"])
+        resp = psi_response()
+        resp["lighthouseResult"]["audits"]["cumulative-layout-shift"]["numericValue"] = 0.05
+        self.assertNotIn("layout_shift_elements", g._psi_diagnostics(resp["lighthouseResult"]["audits"], 0.05))
+
+    def test_bad_lab_strategy(self):
+        with patch.dict(os.environ, {"PAGESPEED_KEY_PATH": key_file()}), patch.object(g, "_cwv_http", lambda *a, **k: crux_record()):
+            self.assertIn("lab_strategy", run(g.get_core_web_vitals("https://example.com", include_lab=True, lab_strategy="x")))
+
+
 if __name__ == "__main__":
     unittest.main()

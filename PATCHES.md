@@ -14,7 +14,7 @@ No automatic `git pull`: upgrades are a manual re-vendor + re-review of this fil
 4. New read-only tool `get_core_web_vitals(url_or_origin, form_factor="ALL", include_lab=False)` (+ tests in
    `test_core_web_vitals.py`, run with `.venv/bin/python -m unittest test_core_web_vitals`). Real-user CrUX
    p75 LCP/INP/CLS/FCP/TTFB with good/needs improvement/poor ratings (page URL first, origin fallback), and
-   optionally PageSpeed Insights v5 lab data. Standard library HTTP only (urllib): no new dependency.
+   optionally PageSpeed Insights v5 lab data (with `include_lab`: compact Lighthouse diagnostics per strategy - top 5 opportunities, LCP element/phases, slow scripts, third parties, layout-shift elements; `lab_strategy=mobile|desktop|both`; URLs stripped of query strings). Standard library HTTP only (urllib): no new dependency.
    API key: read from the FILE `PAGESPEED_KEY_PATH` (default `~/.config/magenio/pagespeed.key`), sent in the
    `X-Goog-Api-Key` header (never in a URL), never returned/logged; errors name the key file by base name only
    and scrub the key from Google's error text. GSC scopes unchanged (readonly).

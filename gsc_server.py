@@ -1546,6 +1546,62 @@ def _crux_query(key: str, origin: str, page: Optional[str], form_factor: str) ->
     return {"scope": None, "metrics": {}, "note": "No CrUX field data for this URL or origin (not enough real-user traffic)."}
 
 
+def _url_short(u: Any, n: int = 80) -> str:
+    """URL for display: no query/fragment (may carry tokens), truncated."""
+    u = str(u or "").split("?", 1)[0].split("#", 1)[0]
+    return u if len(u) <= n else u[: n - 1] + "…"
+
+
+def _items(audit: dict) -> list:
+    return ((audit or {}).get("details") or {}).get("items") or []
+
+
+def _node(it: dict) -> str:
+    n = (it or {}).get("node") or {}
+    return str(n.get("selector") or n.get("snippet") or "")[:120]
+
+
+def _psi_diagnostics(audits: dict, cls_value: Optional[float]) -> dict:
+    """Compact Lighthouse diagnostics from a PSI response (all parts optional)."""
+    d: Dict[str, Any] = {}
+    opps = []
+    for a in audits.values():
+        det = a.get("details") or {}
+        if det.get("type") == "opportunity" and (det.get("overallSavingsMs") or 0) > 0:
+            o = {"audit": a.get("title"), "saves_ms": round(det["overallSavingsMs"])}
+            if det.get("overallSavingsBytes"):
+                o["saves_kb"] = round(det["overallSavingsBytes"] / 1024)
+            res = [_url_short(i.get("url")) for i in det.get("items", []) if i.get("url")][:3]
+            if res:
+                o["resources"] = res
+            opps.append(o)
+    if opps:
+        d["opportunities"] = sorted(opps, key=lambda o: -o["saves_ms"])[:5]
+    lcp = audits.get("largest-contentful-paint-element")
+    if lcp:
+        for blk in _items(lcp):
+            rows = blk.get("items") or []
+            if blk.get("type") == "table" and rows and "node" in rows[0]:
+                d["lcp_element"] = _node(rows[0])
+            elif blk.get("type") == "table" and rows and "phase" in rows[0]:
+                d["lcp_phases_ms"] = {r["phase"]: round(r.get("timing", 0)) for r in rows if "phase" in r}
+    boot = sorted(_items(audits.get("bootup-time")), key=lambda i: -(i.get("total") or 0))[:5]
+    if boot:
+        d["slow_scripts"] = [{"url": _url_short(i.get("url")), "total_ms": round(i.get("total") or 0), "scripting_ms": round(i.get("scripting") or 0)} for i in boot]
+    mt = sorted(_items(audits.get("mainthread-work-breakdown")), key=lambda i: -(i.get("duration") or 0))[:5]
+    if mt:
+        d["main_thread_ms"] = {i.get("groupLabel") or i.get("group"): round(i.get("duration") or 0) for i in mt}
+    tp = sorted(_items(audits.get("third-party-summary")), key=lambda i: -(i.get("blockingTime") or 0))[:5]
+    if tp:
+        d["third_parties"] = [{"entity": str(i.get("entity") if isinstance(i.get("entity"), str) else (i.get("entity") or {}).get("text", ""))[:60],
+                               "blocking_ms": round(i.get("blockingTime") or 0), "transfer_kb": round((i.get("transferSize") or 0) / 1024)} for i in tp]
+    if cls_value is not None and cls_value > 0.1:
+        ls = [{"element": _node(i), "score": round(i.get("score") or 0, 3)} for i in _items(audits.get("layout-shift-elements"))][:5]
+        if ls:
+            d["layout_shift_elements"] = ls
+    return d
+
+
 def _psi_lab(key: str, page_url: str, strategy: str) -> dict:
     from urllib.parse import urlencode
     qs = urlencode({"url": page_url, "strategy": strategy, "category": "performance"})
@@ -1561,11 +1617,13 @@ def _psi_lab(key: str, page_url: str, strategy: str) -> dict:
     score = (lh.get("categories", {}).get("performance") or {}).get("score")
     if score is not None:
         res["performance_score"] = round(score * 100)
+    cls = (audits.get("cumulative-layout-shift") or {}).get("numericValue")
+    res.update(_psi_diagnostics(audits, cls))
     return res
 
 
 @mcp.tool()
-async def get_core_web_vitals(url_or_origin: str, form_factor: str = "ALL", include_lab: bool = False) -> str:
+async def get_core_web_vitals(url_or_origin: str, form_factor: str = "ALL", include_lab: bool = False, lab_strategy: str = "both") -> str:
     """
     Core Web Vitals from real Chrome users (CrUX field data), optionally plus PageSpeed Insights lab data.
 
@@ -1576,7 +1634,11 @@ async def get_core_web_vitals(url_or_origin: str, form_factor: str = "ALL", incl
         url_or_origin: Absolute URL (https://example.com/page) or origin (https://example.com).
         form_factor: PHONE, DESKTOP or ALL (default ALL).
         include_lab: Also run PageSpeed Insights (slower; mobile and desktop for ALL) on the page URL
-                     (the origin when only an origin was given).
+                     (the origin when only an origin was given). Adds a compact Lighthouse diagnosis per strategy:
+                     top opportunities (estimated saving, resources), LCP element and phases, slowest scripts,
+                     main-thread breakdown, third parties, layout-shift elements when CLS > 0.1.
+        lab_strategy: mobile, desktop or both (default). "both" follows form_factor (PHONE/DESKTOP narrow it);
+                     mobile or desktop forces that single run.
     """
     try:
         ff = (form_factor or "ALL").upper()
@@ -1588,7 +1650,10 @@ async def get_core_web_vitals(url_or_origin: str, form_factor: str = "ALL", incl
         result: Dict[str, Any] = {"form_factor": ff, "field_data": field}
         if include_lab:
             lab_url = page or origin
-            strategies = {"PHONE": ["mobile"], "DESKTOP": ["desktop"], "ALL": ["mobile", "desktop"]}[ff]
+            ls = (lab_strategy or "both").lower()
+            if ls not in ("mobile", "desktop", "both"):
+                return "Error: lab_strategy must be mobile, desktop or both."
+            strategies = [ls] if ls != "both" else {"PHONE": ["mobile"], "DESKTOP": ["desktop"], "ALL": ["mobile", "desktop"]}[ff]
             result["lab_data"] = {"url": lab_url}
             for s in strategies:
                 result["lab_data"][s] = await asyncio.to_thread(_psi_lab, key, lab_url, s)
