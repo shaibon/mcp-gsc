@@ -56,6 +56,8 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 
 ---
 
+> **Munder fork:** adds `get_core_web_vitals` (CrUX real-user Core Web Vitals + optional PageSpeed lab data). It needs a Google API key (CrUX + PageSpeed Insights APIs enabled) stored in a file whose path is `PAGESPEED_KEY_PATH` (default `~/.config/magenio/pagespeed.key`). See `PATCHES.md`.
+
 ## Available Tools
 
 | Tool | What It Does | What You Need to Provide |

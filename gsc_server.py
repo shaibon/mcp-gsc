@@ -294,6 +294,9 @@ URL Inspection & Indexing:
   - batch_url_inspection: Inspect up to 10 URLs at once
   - check_indexing_issues: Check multiple URLs for indexing problems
 
+Core Web Vitals:
+  - get_core_web_vitals: Real-user CrUX p75 LCP/INP/CLS/FCP/TTFB (+ optional PageSpeed lab data); needs PAGESPEED_KEY_PATH key file
+
 Sitemaps:
   - get_sitemaps: List all sitemaps for a site
   - list_sitemaps_enhanced: Detailed sitemap info including errors and warnings
@@ -1417,6 +1420,181 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
         })
     except Exception as e:
         return f"Error retrieving sitemap details: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# PATCH(munder): Core Web Vitals (CrUX field data + optional PageSpeed lab data).
+# Read-only. The API key lives in a FILE (PAGESPEED_KEY_PATH, default
+# ~/.config/magenio/pagespeed.key), is sent in the X-Goog-Api-Key header (never in a URL),
+# and is never returned, logged or echoed in an error.
+# ---------------------------------------------------------------------------
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
+
+CRUX_ENDPOINT = "https://chromeuxreport.googleapis.com/v1/records:queryRecord"
+PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+DEFAULT_PAGESPEED_KEY_PATH = os.path.join("~", ".config", "magenio", "pagespeed.key")
+_CWV_TIMEOUT_S = 30
+
+# metric -> (label, good_max, poor_min); a p75 <= good_max is good, > poor_min is poor.
+_CRUX_METRICS = {
+    "largest_contentful_paint": ("LCP", 2500, 4000),
+    "interaction_to_next_paint": ("INP", 200, 500),
+    "cumulative_layout_shift": ("CLS", 0.1, 0.25),
+    "first_contentful_paint": ("FCP", 1800, 3000),
+    "experimental_time_to_first_byte": ("TTFB", 800, 1800),
+}
+
+
+class _CwvError(Exception):
+    """An error message that is safe to show to the agent (never contains the key)."""
+
+
+def _read_pagespeed_key() -> str:
+    raw = os.environ.get("PAGESPEED_KEY_PATH") or DEFAULT_PAGESPEED_KEY_PATH
+    path = os.path.expandvars(os.path.expanduser(raw))
+    name = os.path.basename(path) or "pagespeed.key"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            key = fh.read().strip()
+    except FileNotFoundError:
+        raise _CwvError(f"PageSpeed/CrUX API key file not found: {name}. Set PAGESPEED_KEY_PATH or create the file.")
+    except OSError:
+        raise _CwvError(f"PageSpeed/CrUX API key file could not be read: {name}.")
+    if not key:
+        raise _CwvError(f"PageSpeed/CrUX API key file is empty: {name}.")
+    return key
+
+
+def _cwv_http(method: str, url: str, key: str, body: Optional[dict] = None) -> dict:
+    """One Google API call. Raises _CwvError (key-free) on failure; HTTP 404 -> _CwvNotFound."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "X-Goog-Api-Key": key,
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=_CWV_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise _CwvNotFound()
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        detail = detail.replace(key, "***")
+        hint = " (check the API key: valid, and CrUX/PageSpeed APIs enabled for it)" if e.code in (400, 401, 403) else ""
+        raise _CwvError(f"Google API returned HTTP {e.code}{hint}: {detail[:300]}".rstrip(": "))
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise _CwvError("Could not reach the Google API (network error or timeout).")
+    except ValueError:
+        raise _CwvError("Google API returned an unreadable response.")
+
+
+class _CwvNotFound(Exception):
+    pass
+
+
+def _rate(value: float, good_max: float, poor_min: float) -> str:
+    return "good" if value <= good_max else ("poor" if value > poor_min else "needs improvement")
+
+
+def _parse_crux(record: dict) -> dict:
+    out = {}
+    for name, (label, good_max, poor_min) in _CRUX_METRICS.items():
+        m = (record.get("metrics") or {}).get(name)
+        if not m:
+            continue
+        try:
+            p75 = float((m.get("percentiles") or {})["p75"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        entry = {"p75": p75, "rating": _rate(p75, good_max, poor_min)}
+        hist = m.get("histogram") or []
+        if len(hist) == 3:
+            entry["distribution"] = {k: round(float(h.get("density", 0)), 4) for k, h in zip(("good", "needs_improvement", "poor"), hist)}
+        out[label] = entry
+    return out
+
+
+def _cwv_target(url_or_origin: str):
+    p = urlparse((url_or_origin or "").strip())
+    if p.scheme not in ("http", "https") or not p.netloc:
+        raise _CwvError("url_or_origin must be an absolute http(s) URL or origin, e.g. https://example.com or https://example.com/page")
+    origin = f"{p.scheme}://{p.netloc}"
+    is_page = p.path not in ("", "/") or bool(p.query)
+    return origin, (url_or_origin.strip() if is_page else None)
+
+
+def _crux_query(key: str, origin: str, page: Optional[str], form_factor: str) -> dict:
+    base = {"metrics": list(_CRUX_METRICS)}
+    if form_factor in ("PHONE", "DESKTOP"):
+        base["formFactor"] = form_factor
+    attempts = ([("url", page)] if page else []) + [("origin", origin)]
+    for scope, target in attempts:
+        try:
+            rec = _cwv_http("POST", CRUX_ENDPOINT, key, {**base, scope: target}).get("record", {})
+        except _CwvNotFound:
+            continue
+        return {"scope": scope, "target": target, "metrics": _parse_crux(rec), "collection_period": rec.get("collectionPeriod")}
+    return {"scope": None, "metrics": {}, "note": "No CrUX field data for this URL or origin (not enough real-user traffic)."}
+
+
+def _psi_lab(key: str, page_url: str, strategy: str) -> dict:
+    from urllib.parse import urlencode
+    qs = urlencode({"url": page_url, "strategy": strategy, "category": "performance"})
+    try:
+        d = _cwv_http("GET", f"{PSI_ENDPOINT}?{qs}", key)
+    except _CwvNotFound:
+        return {"error": "PageSpeed could not analyse this URL."}
+    lh = d.get("lighthouseResult", {})
+    audits = lh.get("audits", {})
+    pick = {"LCP": "largest-contentful-paint", "CLS": "cumulative-layout-shift", "TBT": "total-blocking-time",
+            "FCP": "first-contentful-paint", "SpeedIndex": "speed-index"}
+    res = {k: audits[a].get("displayValue") for k, a in pick.items() if a in audits}
+    score = (lh.get("categories", {}).get("performance") or {}).get("score")
+    if score is not None:
+        res["performance_score"] = round(score * 100)
+    return res
+
+
+@mcp.tool()
+async def get_core_web_vitals(url_or_origin: str, form_factor: str = "ALL", include_lab: bool = False) -> str:
+    """
+    Core Web Vitals from real Chrome users (CrUX field data), optionally plus PageSpeed Insights lab data.
+
+    Reports p75 LCP, INP, CLS, FCP and TTFB with a good / needs improvement / poor rating. A page URL is
+    tried first and falls back to its origin when CrUX has no data for that page.
+
+    Args:
+        url_or_origin: Absolute URL (https://example.com/page) or origin (https://example.com).
+        form_factor: PHONE, DESKTOP or ALL (default ALL).
+        include_lab: Also run PageSpeed Insights (slower; mobile and desktop for ALL) on the page URL
+                     (the origin when only an origin was given).
+    """
+    try:
+        ff = (form_factor or "ALL").upper()
+        if ff not in ("PHONE", "DESKTOP", "ALL"):
+            return "Error: form_factor must be PHONE, DESKTOP or ALL."
+        origin, page = _cwv_target(url_or_origin)
+        key = _read_pagespeed_key()
+        field = await asyncio.to_thread(_crux_query, key, origin, page, ff)
+        result: Dict[str, Any] = {"form_factor": ff, "field_data": field}
+        if include_lab:
+            lab_url = page or origin
+            strategies = {"PHONE": ["mobile"], "DESKTOP": ["desktop"], "ALL": ["mobile", "desktop"]}[ff]
+            result["lab_data"] = {"url": lab_url}
+            for s in strategies:
+                result["lab_data"][s] = await asyncio.to_thread(_psi_lab, key, lab_url, s)
+        return json.dumps(result)
+    except _CwvError as e:
+        return f"Error: {e}"
+    except Exception:
+        # Never surface raw exception text here: it could carry request details.
+        return "Error: unexpected failure while fetching Core Web Vitals."
+
 
 @mcp.tool()
 async def get_creator_info() -> str:
