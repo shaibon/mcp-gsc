@@ -85,6 +85,29 @@ class Tools(unittest.TestCase):
     def test_bad_ids_rejected(self):
         self.assertTrue(run(g.gtm_list_containers("1/../2")).startswith("Error:"))
 
+    def test_unicode_digits_rejected(self):
+        for bad in ("١٢٣", "²", "12 "):
+            self.assertTrue(run(g.gtm_list_containers(bad)).startswith("Error:"), bad)
+
+    def test_secrets_redacted_in_list_and_diff(self):
+        def ga(secret):
+            return {"tagId": "1", "name": "MP", "type": "gaawe", "firingTriggerId": ["1"], "parameter": [
+                {"type": "template", "key": "api_secret", "value": secret},
+                {"type": "template", "key": "html", "value": "<script>var k='" + "A1b2C3d4" * 4 + "';</script>"},
+                {"type": "template", "key": "eventName", "value": "page_view"}]}
+        va, vb = version(1, tags=[ga("OLDSECRETVALUE")]), version(2, tags=[ga("NEWSECRETVALUE")])
+        svc = MagicMock()
+        svc.accounts().containers().versions().get.side_effect = lambda path: MagicMock(execute=lambda: {"1": va, "2": vb}[path.rsplit("/", 1)[1]])
+        svc.accounts().containers().versions().live().execute.return_value = vb
+        with patch.object(g, "get_gtm_service", return_value=svc):
+            diff = run(g.gtm_diff_versions("1", "2", "1", "2"))
+            live = run(g.gtm_get_live_version("1", "2"))
+        for out in (diff, live):
+            self.assertNotIn("SECRETVALUE", out)
+            self.assertNotIn("A1b2C3d4" * 4, out)
+        self.assertIn("page_view", live)
+        self.assertEqual(json.loads(diff).get("tags", {}).get("modified", [{}])[0].get("changed", {}).get("parameter", {}).get("html"), None)
+
     def test_diff_versions(self):
         va = version(1, tags=[tag(1, "GA", "a"), tag(2, "Old")], variables=[{"variableId": "9", "name": "v", "type": "c"}])
         vb = version(2, tags=[tag(1, "GA", "b", paused=True), tag(3, "New")], variables=[{"variableId": "9", "name": "v", "type": "c"}])

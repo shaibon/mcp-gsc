@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 import asyncio
 import logging
 import os
+import re
 import json
 import sys
 import shutil
@@ -1670,17 +1671,23 @@ def _gtm_collect(request, key: str, limit: int, list_next) -> tuple:
         resp = request.execute()
 
 
+_GTM_SECRET_KEY = re.compile(r"secret|token|key|password|passwd|auth|credential|bearer", re.I)
+_GTM_TOKENISH = re.compile(r"[A-Za-z0-9_\-]{24,}")
+
+
 def _short(v: Any, n: int = 120) -> Any:
+    """Compact display of a value; long token-like runs (keys pasted in Custom HTML/JS) are masked."""
     s = v if isinstance(v, str) else json.dumps(v, sort_keys=True)
+    s = _GTM_TOKENISH.sub("***", s)
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
 def _params(entity: dict) -> dict:
-    """Flat key -> short value for simple (non-nested) parameters."""
+    """Flat key -> short value for simple (non-nested) parameters; secret-looking names show ***."""
     out = {}
     for p in entity.get("parameter", []) or []:
         if "key" in p and "value" in p:
-            out[p["key"]] = _short(p["value"])
+            out[p["key"]] = "***" if _GTM_SECRET_KEY.search(p["key"]) else _short(p["value"])
     return out
 
 
@@ -1708,7 +1715,7 @@ def _ws_path(account_id: str, container_id: str, workspace_id: str = "") -> str:
 
 def _gtm_ids(*vals: str) -> Optional[str]:
     for v in vals:
-        if not str(v).isdigit():
+        if not re.fullmatch(r"[0-9]+", str(v)):
             return "Error: account_id, container_id, workspace_id and version ids must be numeric ids (see the gtm_list_* tools)."
     return None
 
