@@ -19,6 +19,17 @@ No automatic `git pull`: upgrades are a manual re-vendor + re-review of this fil
    `X-Goog-Api-Key` header (never in a URL), never returned/logged; errors name the key file by base name only
    and scrub the key from Google's error text. GSC scopes unchanged (readonly).
 
+5. New read-only Google Tag Manager tools (API v2 via the already-present google-api-python-client, no new
+   dependency): `gtm_list_accounts`, `gtm_list_containers(account_id)`, `gtm_list_workspaces(account_id, container_id)`,
+   `gtm_get_live_version(account_id, container_id, limit=50)`, `gtm_list_versions(account_id, container_id, limit=20)`,
+   `gtm_diff_versions(account_id, container_id, version_a, version_b)` (ids or "live"),
+   `gtm_list_tags|triggers|variables(account_id, container_id, workspace_id, limit=50)`. Tests: `test_gtm.py`
+   (`.venv/bin/python -m unittest test_gtm`). Same key as GSC (`GSC_CREDENTIALS_PATH`) but a separate token with ONLY
+   `https://www.googleapis.com/auth/tagmanager.readonly`; GSC `SCOPES` is unchanged. Only list/get/live calls exist.
+   Output is compact (limits, `truncated` flags, noise fields such as fingerprint/path dropped). 403 -> "the service
+   account has no access to GTM container X", never a path or secret. The service account must be added as a
+   Read user in Tag Manager and the Tag Manager API enabled in its Google Cloud project.
+
 Not patched (by design): the OAuth fallback code is still present but unreachable in use because Munder starts the
 server with `GSC_SKIP_OAUTH=true` and `GSC_CREDENTIALS_PATH=<project service-account key>`.
 `test_gsc_server.py` still contains tests for the removed tools; they are expected to fail and are not run.

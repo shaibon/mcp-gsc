@@ -297,6 +297,9 @@ URL Inspection & Indexing:
 Core Web Vitals:
   - get_core_web_vitals: Real-user CrUX p75 LCP/INP/CLS/FCP/TTFB (+ optional PageSpeed lab data); needs PAGESPEED_KEY_PATH key file
 
+Tag Manager (read-only, same service account):
+  - gtm_list_accounts, gtm_list_containers, gtm_list_workspaces, gtm_get_live_version, gtm_list_versions, gtm_diff_versions, gtm_list_tags, gtm_list_triggers, gtm_list_variables
+
 Sitemaps:
   - get_sitemaps: List all sitemaps for a site
   - list_sitemaps_enhanced: Detailed sitemap info including errors and warnings
@@ -1594,6 +1597,301 @@ async def get_core_web_vitals(url_or_origin: str, form_factor: str = "ALL", incl
     except Exception:
         # Never surface raw exception text here: it could carry request details.
         return "Error: unexpected failure while fetching Core Web Vitals."
+
+
+# ---------------------------------------------------------------------------
+# PATCH(munder): Google Tag Manager, READ-ONLY (API v2). Same service-account key as GSC
+# (GSC_CREDENTIALS_PATH), but its own token with ONLY the tagmanager.readonly scope. Only
+# list/get/live calls are made; nothing here can create, update, publish or delete.
+# ---------------------------------------------------------------------------
+GTM_SCOPES = ["https://www.googleapis.com/auth/tagmanager.readonly"]
+_GTM_DEFAULT_LIMIT = 50
+_GTM_MAX_LIMIT = 200
+_GTM_NOISE = {"fingerprint", "path", "tagManagerUrl", "accountId", "containerId", "workspaceId",
+              "containerVersionId", "tagId", "triggerId", "variableId", "clientId", "templateId",
+              "folderId", "transformationId", "zoneId"}
+# version content collections: key in the API response -> (label, id field)
+_GTM_COLLECTIONS = {
+    "tag": ("tags", "tagId"), "trigger": ("triggers", "triggerId"), "variable": ("variables", "variableId"),
+    "client": ("clients", "clientId"), "customTemplate": ("templates", "templateId"),
+    "transformation": ("transformations", "transformationId"), "folder": ("folders", "folderId"),
+}
+
+
+def get_gtm_service():
+    """Authorised Tag Manager v2 service: the project's service-account key, tagmanager.readonly only."""
+    if GSC_CREDENTIALS_PATH and not os.path.exists(GSC_CREDENTIALS_PATH):
+        raise FileNotFoundError("GSC_CREDENTIALS_PATH is set but the file does not exist.")
+    for cred_path in POSSIBLE_CREDENTIAL_PATHS:
+        if cred_path and os.path.exists(cred_path):
+            try:
+                creds = service_account.Credentials.from_service_account_file(cred_path, scopes=GTM_SCOPES)
+                return build("tagmanager", "v2", credentials=creds, cache_discovery=False)
+            except Exception:
+                continue
+    raise FileNotFoundError("No usable service-account credentials for Tag Manager.")
+
+
+def _gtm_err(e: Exception, what: str) -> str:
+    """Key/path-free error text."""
+    if isinstance(e, HttpError):
+        status = getattr(e.resp, "status", None)
+        if status == 403:
+            return f"Error: the service account has no access to {what} (grant it Read access in Tag Manager, and enable the Tag Manager API)."
+        if status == 404:
+            return f"Error: {what} not found."
+        if status == 429:
+            return "Error: Tag Manager API quota exceeded, retry later."
+        return f"Error: Tag Manager API returned HTTP {status} for {what}."
+    if isinstance(e, FileNotFoundError):
+        return "Error: Tag Manager credentials are not configured."
+    return f"Error: unexpected failure while reading {what}."
+
+
+def _gtm_limit(limit: int) -> int:
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = _GTM_DEFAULT_LIMIT
+    return max(1, min(n, _GTM_MAX_LIMIT))
+
+
+def _gtm_collect(request, key: str, limit: int, list_next) -> tuple:
+    """Follow nextPageToken until `limit` items; returns (items, truncated)."""
+    items: List[dict] = []
+    resp = request.execute()
+    while True:
+        items.extend(resp.get(key, []))
+        if len(items) >= limit:
+            return items[:limit], len(items) > limit or bool(resp.get("nextPageToken"))
+        request = list_next(request, resp)
+        if request is None:
+            return items, False
+        resp = request.execute()
+
+
+def _short(v: Any, n: int = 120) -> Any:
+    s = v if isinstance(v, str) else json.dumps(v, sort_keys=True)
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _params(entity: dict) -> dict:
+    """Flat key -> short value for simple (non-nested) parameters."""
+    out = {}
+    for p in entity.get("parameter", []) or []:
+        if "key" in p and "value" in p:
+            out[p["key"]] = _short(p["value"])
+    return out
+
+
+def _brief(kind: str, e: dict) -> dict:
+    idf = _GTM_COLLECTIONS.get(kind, (None, kind + "Id"))[1]
+    b = {"id": e.get(idf), "name": e.get("name"), "type": e.get("type")}
+    if kind == "tag":
+        b["firing_triggers"] = e.get("firingTriggerId", [])
+        if e.get("blockingTriggerId"):
+            b["blocking_triggers"] = e["blockingTriggerId"]
+        if e.get("paused"):
+            b["paused"] = True
+    if kind == "trigger" and e.get("filter"):
+        b["conditions"] = len(e["filter"])
+    pr = _params(e)
+    if pr:
+        b["params"] = dict(list(pr.items())[:8])
+    return {k: v for k, v in b.items() if v not in (None, [], {})}
+
+
+def _ws_path(account_id: str, container_id: str, workspace_id: str = "") -> str:
+    base = f"accounts/{account_id}/containers/{container_id}"
+    return f"{base}/workspaces/{workspace_id}" if workspace_id else base
+
+
+def _gtm_ids(*vals: str) -> Optional[str]:
+    for v in vals:
+        if not str(v).isdigit():
+            return "Error: account_id, container_id, workspace_id and version ids must be numeric ids (see the gtm_list_* tools)."
+    return None
+
+
+@mcp.tool()
+async def gtm_list_accounts() -> str:
+    """List the Google Tag Manager accounts the service account can read."""
+    try:
+        svc = get_gtm_service()
+        accounts, trunc = _gtm_collect(svc.accounts().list(), "account", _GTM_DEFAULT_LIMIT, lambda r, rs: svc.accounts().list_next(r, rs))
+        return json.dumps({"accounts": [{"account_id": a.get("accountId"), "name": a.get("name")} for a in accounts], "truncated": trunc})
+    except Exception as e:
+        return _gtm_err(e, "Tag Manager accounts")
+
+
+@mcp.tool()
+async def gtm_list_containers(account_id: str) -> str:
+    """List containers of a GTM account, with their type (web, server, ...) and public id (GTM-XXXX)."""
+    bad = _gtm_ids(account_id)
+    if bad:
+        return bad
+    try:
+        svc = get_gtm_service()
+        c = svc.accounts().containers()
+        items, trunc = _gtm_collect(c.list(parent=f"accounts/{account_id}"), "container", _GTM_MAX_LIMIT, lambda r, rs: c.list_next(r, rs))
+        return json.dumps({"containers": [{"container_id": x.get("containerId"), "name": x.get("name"),
+                                           "public_id": x.get("publicId"), "type": x.get("usageContext", [])} for x in items], "truncated": trunc})
+    except Exception as e:
+        return _gtm_err(e, f"GTM account {account_id}")
+
+
+@mcp.tool()
+async def gtm_list_workspaces(account_id: str, container_id: str) -> str:
+    """List the workspaces of a GTM container (needed for gtm_list_tags/triggers/variables)."""
+    bad = _gtm_ids(account_id, container_id)
+    if bad:
+        return bad
+    try:
+        svc = get_gtm_service()
+        w = svc.accounts().containers().workspaces()
+        items, trunc = _gtm_collect(w.list(parent=_ws_path(account_id, container_id)), "workspace", _GTM_MAX_LIMIT, lambda r, rs: w.list_next(r, rs))
+        return json.dumps({"workspaces": [{"workspace_id": x.get("workspaceId"), "name": x.get("name"),
+                                           "description": _short(x.get("description", ""), 100)} for x in items], "truncated": trunc})
+    except Exception as e:
+        return _gtm_err(e, f"GTM container {container_id}")
+
+
+def _version_summary(v: dict, limit: int) -> dict:
+    out: Dict[str, Any] = {"version_id": v.get("containerVersionId"), "name": v.get("name"),
+                           "container": {k: v.get("container", {}).get(k) for k in ("publicId", "name", "usageContext")}}
+    counts, sections = {}, {}
+    for kind, (label, _idf) in _GTM_COLLECTIONS.items():
+        items = v.get(kind, []) or []
+        counts[label] = len(items)
+        if items:
+            sections[label] = [_brief(kind, e) for e in items[:limit]]
+            if len(items) > limit:
+                sections[label + "_truncated"] = len(items) - limit
+    out["counts"] = counts
+    out.update(sections)
+    return out
+
+
+@mcp.tool()
+async def gtm_get_live_version(account_id: str, container_id: str, limit: int = 50) -> str:
+    """
+    The live (published) version of a GTM container, synthesised: counts plus a compact line per
+    tag / trigger / variable / client / template / folder (web and server containers).
+
+    Args:
+        limit: max entries listed per section (default 50, max 200); counts are always complete.
+    """
+    bad = _gtm_ids(account_id, container_id)
+    if bad:
+        return bad
+    try:
+        v = get_gtm_service().accounts().containers().versions().live(parent=_ws_path(account_id, container_id)).execute()
+        return json.dumps(_version_summary(v, _gtm_limit(limit)))
+    except Exception as e:
+        return _gtm_err(e, f"GTM container {container_id}")
+
+
+@mcp.tool()
+async def gtm_list_versions(account_id: str, container_id: str, limit: int = 20) -> str:
+    """Version headers of a GTM container (id, name, counts, deleted flag), newest first as returned by the API."""
+    bad = _gtm_ids(account_id, container_id)
+    if bad:
+        return bad
+    try:
+        svc = get_gtm_service()
+        vh = svc.accounts().containers().version_headers()
+        items, trunc = _gtm_collect(vh.list(parent=_ws_path(account_id, container_id)), "containerVersionHeader", _gtm_limit(limit), lambda r, rs: vh.list_next(r, rs))
+        keep = ("containerVersionId", "name", "numTags", "numTriggers", "numVariables", "numClients", "numCustomTemplates", "deleted")
+        return json.dumps({"versions": [{k: x[k] for k in keep if k in x} for x in items], "truncated": trunc})
+    except Exception as e:
+        return _gtm_err(e, f"GTM container {container_id}")
+
+
+def _get_version(svc, account_id: str, container_id: str, version: str) -> dict:
+    vs = svc.accounts().containers().versions()
+    base = _ws_path(account_id, container_id)
+    if str(version).lower() == "live":
+        return vs.live(parent=base).execute()
+    return vs.get(path=f"{base}/versions/{version}").execute()
+
+
+def _diff_entity(a: dict, b: dict) -> dict:
+    changed = {}
+    for k in sorted((set(a) | set(b)) - _GTM_NOISE):
+        if a.get(k) != b.get(k):
+            if k == "parameter":
+                pa, pb = _params(a), _params(b)
+                keys = sorted(k2 for k2 in set(pa) | set(pb) if pa.get(k2) != pb.get(k2))
+                changed["parameter"] = {k2: {"from": pa.get(k2), "to": pb.get(k2)} for k2 in keys[:10]}
+            else:
+                changed[k] = {"from": _short(a.get(k)), "to": _short(b.get(k))}
+    return changed
+
+
+@mcp.tool()
+async def gtm_diff_versions(account_id: str, container_id: str, version_a: str, version_b: str) -> str:
+    """
+    Compare two versions of a GTM container: tags, triggers, variables, clients, templates, folders
+    added / removed / modified (with the changed fields). version_a is the base ("from"), version_b the
+    target ("to"); either may be the word "live".
+    """
+    bad = _gtm_ids(account_id, container_id) or _gtm_ids(*[v for v in (version_a, version_b) if str(v).lower() != "live"])
+    if bad:
+        return bad
+    try:
+        svc = get_gtm_service()
+        va, vb = _get_version(svc, account_id, container_id, version_a), _get_version(svc, account_id, container_id, version_b)
+        out: Dict[str, Any] = {"from": va.get("containerVersionId"), "to": vb.get("containerVersionId")}
+        for kind, (label, idf) in _GTM_COLLECTIONS.items():
+            ma = {e.get(idf): e for e in va.get(kind, []) or []}
+            mb = {e.get(idf): e for e in vb.get(kind, []) or []}
+            added = [_brief(kind, mb[i]) for i in mb if i not in ma]
+            removed = [_brief(kind, ma[i]) for i in ma if i not in mb]
+            modified = []
+            for i in ma:
+                if i in mb:
+                    ch = _diff_entity(ma[i], mb[i])
+                    if ch:
+                        modified.append({"id": i, "name": mb[i].get("name"), "changed": ch})
+            if added or removed or modified:
+                out[label] = {"added": added[:_GTM_DEFAULT_LIMIT], "removed": removed[:_GTM_DEFAULT_LIMIT], "modified": modified[:_GTM_DEFAULT_LIMIT]}
+        if len(out) == 2:
+            out["note"] = "No differences."
+        return json.dumps(out)
+    except Exception as e:
+        return _gtm_err(e, f"GTM container {container_id}")
+
+
+async def _gtm_workspace_list(kind: str, account_id: str, container_id: str, workspace_id: str, limit: int) -> str:
+    bad = _gtm_ids(account_id, container_id, workspace_id)
+    if bad:
+        return bad
+    try:
+        svc = get_gtm_service()
+        res = getattr(svc.accounts().containers().workspaces(), _GTM_COLLECTIONS[kind][0])()
+        n = _gtm_limit(limit)
+        items, trunc = _gtm_collect(res.list(parent=_ws_path(account_id, container_id, workspace_id)), kind, n, lambda r, rs: res.list_next(r, rs))
+        return json.dumps({_GTM_COLLECTIONS[kind][0]: [_brief(kind, e) for e in items], "truncated": trunc})
+    except Exception as e:
+        return _gtm_err(e, f"GTM workspace {workspace_id}")
+
+
+@mcp.tool()
+async def gtm_list_tags(account_id: str, container_id: str, workspace_id: str, limit: int = 50) -> str:
+    """Tags of a GTM workspace (id, name, type, firing/blocking trigger ids, paused, key parameters)."""
+    return await _gtm_workspace_list("tag", account_id, container_id, workspace_id, limit)
+
+
+@mcp.tool()
+async def gtm_list_triggers(account_id: str, container_id: str, workspace_id: str, limit: int = 50) -> str:
+    """Triggers of a GTM workspace (id, name, type, number of conditions)."""
+    return await _gtm_workspace_list("trigger", account_id, container_id, workspace_id, limit)
+
+
+@mcp.tool()
+async def gtm_list_variables(account_id: str, container_id: str, workspace_id: str, limit: int = 50) -> str:
+    """Variables of a GTM workspace (id, name, type, key parameters)."""
+    return await _gtm_workspace_list("variable", account_id, container_id, workspace_id, limit)
 
 
 @mcp.tool()
